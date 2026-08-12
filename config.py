@@ -52,6 +52,7 @@ SYMBOLS = [
     "USDJPY",   # Dollar/Yen
     "USDCHF",   # Dollar/Franc suisse
     "AUDUSD",   # Dollar australien
+    "NAS100",   # Nasdaq 100
 ]
 
 # ─────────────────────────────────────────────
@@ -66,7 +67,7 @@ SL_ATR_MULT      = 2.0       # Stop loss = 2× ATR
 TP_ATR_MULT      = 4.0       # Take profit = 4× ATR
 CONF_PCT         = 0.30      # Seuil de confluence (30% du score max)
 COOLDOWN_BARS    = 10        # Barres minimum entre deux trades
-TARGET_TPD       = 1.0       # Trades par jour cible
+TARGET_TPD       = 5.0       # Trades par jour cible (mesuré empiriquement: 1.0 -> ~0.3 trade/j réel, 5.0 -> ~1.4 trade/j réel)
 CAPITAL_REF      = 10_000.0  # Capital de référence pour le sizing
 
 # ─────────────────────────────────────────────

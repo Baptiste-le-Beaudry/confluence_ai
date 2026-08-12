@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from telegram_notify import notify_trade_open, notify_trade_close
+from dashboard import bot_data
 
 logger = logging.getLogger("confluence_bot")
 
@@ -51,6 +52,8 @@ SYMBOL_MAP = {
     "EURGBP":  "EURGBP",
     "EURJPY":  "EURJPY",
     "GBPJPY":  "GBPJPY",
+    # Indices
+    "NAS100":  "NAS100",       # Nasdaq 100
 }
 
 # Paramètres de risque par type d'actif
@@ -70,6 +73,14 @@ ASSET_CONFIG = {
         "min_lot":     0.01,
         "max_lot":     5.0,
         "comment":     "Confluence AI - Gold",
+    },
+    "NAS100": {
+        "risk_pct":    0.01,
+        "sl_atr_mult": 2.0,
+        "tp_atr_mult": 4.0,
+        "min_lot":     0.01,
+        "max_lot":     2.0,
+        "comment":     "Confluence AI - Nasdaq",
     },
     "DEFAULT": {
         "risk_pct":    0.01,
@@ -139,6 +150,7 @@ class MT5Broker:
         self.trades: list[MT5Trade] = []
         self.realized_pnl: float = 0.0
         self._connected = False
+        self.is_demo: Optional[bool] = None
 
     # ─────────────────────────────────────────
     # Connexion
@@ -167,8 +179,12 @@ class MT5Broker:
             return False
 
         self._connected = True
-        logger.info(f"MT5 connecté: compte={info.login}, broker={info.company}, "
+        self.is_demo = (info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO)
+        account_type = "DEMO (argent fictif)" if self.is_demo else "RÉEL (argent réel !)"
+        logger.info(f"MT5 connecté: compte={info.login} [{account_type}], broker={info.company}, "
                     f"balance=${info.balance:.2f}, levier=1:{info.leverage}")
+        if not self.is_demo:
+            logger.warning("⚠️⚠️⚠️  CE COMPTE MT5 EST UN COMPTE RÉEL — DE L'ARGENT RÉEL SERA ENGAGÉ  ⚠️⚠️⚠️")
         return True
 
     def disconnect(self):
@@ -349,9 +365,10 @@ class MT5Broker:
         # Lot correspondant au risque désiré
         lot = risk_usd / (sl_ticks * tick_value)
 
-        # Normaliser selon les règles du broker
-        lot = max(lot, info.volume_min)
-        lot = min(lot, info.volume_max)
+        # Normaliser selon les règles du broker ET les plafonds par actif (ASSET_CONFIG)
+        cfg = ASSET_CONFIG.get(symbol.upper(), ASSET_CONFIG["DEFAULT"])
+        lot = max(lot, info.volume_min, cfg["min_lot"])
+        lot = min(lot, info.volume_max, cfg["max_lot"])
 
         # Arrondir au pas de lot
         step = info.volume_step
@@ -545,6 +562,11 @@ class MT5Broker:
                 trade.exit_price = close_price
                 trade.exit_time = datetime.now()
                 trade.pnl_usd = pnl
+                bot_data.add_trade({
+                    "symbol": symbol, "direction": trade.direction,
+                    "pnl_usd": pnl, "exit_reason": reason,
+                    "exit_time": trade.exit_time.isoformat(),
+                })
 
             notify_trade_close(
                 symbol=symbol,
@@ -573,6 +595,55 @@ class MT5Broker:
             success = success and result
 
         return success
+
+    def sync_closed_trades(self) -> list:
+        """
+        Détecte les trades tracés en interne (self.trades) dont la position a
+        disparu côté MT5 (TP/SL touché, fermeture manuelle depuis le terminal, etc.)
+        sans être passée par close_position(). Met à jour leur P&L réel depuis
+        l'historique des deals et notifie/retourne les trades nouvellement fermés.
+
+        À appeler périodiquement (ex: à chaque itération de la boucle principale)
+        pour que le dashboard et les résumés reflètent TOUS les trades, pas
+        uniquement ceux fermés explicitement par le bot.
+        """
+        open_tickets = {p.ticket for p in self.get_open_positions()}
+        newly_closed = []
+
+        for trade in self.trades:
+            if trade.exit_time is not None or trade.ticket in open_tickets:
+                continue
+
+            deals = mt5.history_deals_get(position=trade.ticket)
+            exit_price = trade.entry_price
+            pnl = 0.0
+            if deals:
+                closing_deals = [d for d in deals if d.entry == 1]  # DEAL_ENTRY_OUT
+                if closing_deals:
+                    exit_price = closing_deals[-1].price
+                    pnl = sum(d.profit for d in closing_deals)
+
+            self.realized_pnl += pnl
+            trade.exit_price = exit_price
+            trade.exit_time  = datetime.now()
+            trade.pnl_usd    = pnl
+            pnl_pct = (pnl / trade.risk_usd * 100.0) if trade.risk_usd else 0.0
+
+            bot_data.add_trade({
+                "symbol": trade.symbol, "direction": trade.direction,
+                "pnl_usd": pnl, "exit_reason": "TP/SL/manuel",
+                "exit_time": trade.exit_time.isoformat(),
+            })
+            notify_trade_close(
+                symbol=trade.symbol, direction=trade.direction,
+                entry=trade.entry_price, exit_price=exit_price,
+                pnl_usd=pnl, pnl_pct=pnl_pct, reason="TP/SL/manuel",
+            )
+            logger.info(f"Position fermée côté broker (TP/SL/manuel): "
+                        f"{trade.symbol} #{trade.ticket} | P&L={pnl:+.2f}$")
+            newly_closed.append(trade)
+
+        return newly_closed
 
     def modify_sl_tp(self, symbol: str, sl: float, tp: float) -> bool:
         """

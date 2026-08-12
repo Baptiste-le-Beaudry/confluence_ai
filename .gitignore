@@ -27,3 +27,11 @@ logs/
 
 # Local artifacts
 wf_report.png
+*.png
+*_metrics.csv
+*_trades.csv
+equity_backtest_comparison.csv
+
+# Market data
+data_1min/
+data_equity/

@@ -12,6 +12,10 @@ NOUVELLE APPROCHE:
   réelle des probabilités produites par le réseau.
 """
 
+import os
+import hashlib
+from pathlib import Path
+
 import numpy as np
 from dataclasses import dataclass, field
 from collections import deque
@@ -32,6 +36,14 @@ N_FEAT   = 13
 N_HIDDEN = 6   # Augmenté: plus de capacité
 
 FEAT_NAMES = ["vwap","fib","gann","ich","ema","ob","fvg","sr","vol","bos","bb","cvd","mom"]
+
+WEIGHTS_SCHEMA_VERSION = 1
+
+
+def _feat_signature() -> str:
+    """Signature de la liste de features — sert à refuser le chargement de
+    poids sauvegardés avec un jeu de features différent (ex: 14e indicateur ajouté)."""
+    return hashlib.sha1("|".join(FEAT_NAMES).encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -64,17 +76,27 @@ class NeuralNet:
     Réseau 13 → 6 (tanh) → 1 (sigmoid).
     Pré-entraîné sur les setups gagnants historiques, puis apprentissage online.
     """
-    def __init__(self, lr=0.02, grad_clip=0.5, decay=0.0005, n_hidden=N_HIDDEN):
+    def __init__(self, lr=0.02, grad_clip=0.5, decay=0.0005, n_hidden=N_HIDDEN,
+                 anchor_rate=0.01, n_feat=N_FEAT):
         self.lr        = lr
         self.grad_clip = grad_clip
         self.decay     = decay
         self.n_hidden  = n_hidden
+        self.anchor_rate = anchor_rate
+        self.n_feat    = n_feat   # taille du vecteur d'entrée — 13 en mode bougie
+                                   # unique, multiple de 13 en mode fenêtre de contexte
 
         # Initialisation Xavier pour une meilleure convergence
-        scale1 = np.sqrt(2.0 / (N_FEAT + n_hidden))
+        scale1 = np.sqrt(2.0 / (n_feat + n_hidden))
         scale2 = np.sqrt(2.0 / (n_hidden + 1))
-        self.W1 = np.random.randn(n_hidden, N_FEAT + 1) * scale1
+        self.W1 = np.random.randn(n_hidden, n_feat + 1) * scale1
         self.W2 = np.random.randn(n_hidden + 1) * scale2
+
+        # Ancre de simulation (W_base) — définie via set_anchor() après la
+        # simulation de démarrage. Tant qu'elle est None, train_step utilise
+        # le decay classique (oubli vers zéro), utilisé pendant le pré-entraînement.
+        self.W1_base = None
+        self.W2_base = None
 
         self.train_losses: list[float] = []
         self.n_samples = 0
@@ -108,8 +130,14 @@ class NeuralNet:
 
         g_out = np.clip((proba - label) * weight, -self.grad_clip, self.grad_clip)
 
-        self.W2 *= (1.0 - self.decay)
-        self.W1 *= (1.0 - self.decay)
+        if self.W1_base is not None:
+            # Ancrage: dérive douce vers la simulation de démarrage plutôt que
+            # vers zéro — la simulation sert de filet de sécurité anti-dérive.
+            self.W2 += self.anchor_rate * (self.W2_base - self.W2)
+            self.W1 += self.anchor_rate * (self.W1_base - self.W1)
+        else:
+            self.W2 *= (1.0 - self.decay)
+            self.W1 *= (1.0 - self.decay)
 
         a1_b = np.append(a1, 1.0)
         self.W2 -= self.lr * g_out * a1_b
@@ -176,11 +204,93 @@ class NeuralNet:
         return thresh_long, thresh_short
 
     def get_weights_summary(self) -> dict:
+        """Importance par feature. En mode fenêtre de contexte (n_feat multiple
+        de len(FEAT_NAMES)), les colonnes se répètent une fois par bougie de la
+        fenêtre — étiquetées "{indicateur}_t-{k}" (t-0 = bougie la plus récente)."""
+        n = len(FEAT_NAMES)
+        if self.n_feat == n:
+            names = FEAT_NAMES
+        elif self.n_feat % n == 0:
+            seq_len = self.n_feat // n
+            names = [f"{nm}_t-{seq_len-1-k}" for k in range(seq_len) for nm in FEAT_NAMES]
+        else:
+            names = [f"feat_{i}" for i in range(self.n_feat)]
+
         importance = {}
-        for i, name in enumerate(FEAT_NAMES):
+        for i, name in enumerate(names):
             col_norm = np.linalg.norm(self.W1[:, i])
             importance[name] = float(col_norm * np.linalg.norm(self.W2[:self.n_hidden]))
         return importance
+
+    def set_anchor(self, W1_base: np.ndarray, W2_base: np.ndarray):
+        """Fixe l'ancre de simulation (W_base) vers laquelle train_step dérive
+        au lieu d'oublier vers zéro. À appeler une fois par démarrage."""
+        self.W1_base = np.array(W1_base, dtype=np.float64, copy=True)
+        self.W2_base = np.array(W2_base, dtype=np.float64, copy=True)
+
+    # ─────────────────────────────────────────
+    # Persistance (Phase 1 — mémoire long terme)
+    # ─────────────────────────────────────────
+
+    def save(self, path: str):
+        """Sauvegarde W1, W2, proba_history et n_samples sur disque (atomique)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.stem + ".tmp.npz")
+        np.savez(
+            tmp_path,
+            W1=self.W1,
+            W2=self.W2,
+            proba_history=np.array(self.proba_history, dtype=np.float64),
+            n_samples=np.array([self.n_samples]),
+            n_feat=np.array([self.n_feat]),
+            n_hidden=np.array([self.n_hidden]),
+            feat_sig=np.array([_feat_signature()]),
+            schema_version=np.array([WEIGHTS_SCHEMA_VERSION]),
+        )
+        os.replace(tmp_path, path)
+
+    @classmethod
+    def load(cls, path: str, lr=0.02, grad_clip=0.5, decay=0.0005,
+              anchor_rate=0.01, n_feat=N_FEAT) -> "NeuralNet | None":
+        """
+        Charge des poids sauvegardés. Retourne None (et refuse le chargement)
+        si le fichier est absent, corrompu, ou si sa signature de features ne
+        correspond pas au schéma actuel — sinon on chargerait des poids qui
+        n'ont plus aucun sens (ex: après ajout d'un 14e indicateur, ou une
+        fenêtre de contexte de taille différente).
+
+        n_feat: taille du vecteur d'entrée ATTENDU par l'appelant (13 en mode
+        bougie unique, seq_len*13 en mode fenêtre de contexte) — le chargement
+        est refusé si le fichier ne correspond pas.
+        """
+        path = Path(path)
+        if not path.exists():
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                loaded_n_feat  = int(data["n_feat"][0])
+                n_hidden       = int(data["n_hidden"][0])
+                feat_sig       = str(data["feat_sig"][0])
+                schema_version = int(data["schema_version"][0])
+                W1, W2         = data["W1"].copy(), data["W2"].copy()
+                proba_history  = list(data["proba_history"])
+                n_samples      = int(data["n_samples"][0])
+        except Exception:
+            return None
+
+        if (loaded_n_feat != n_feat or feat_sig != _feat_signature()
+                or schema_version != WEIGHTS_SCHEMA_VERSION
+                or W1.shape != (n_hidden, n_feat + 1) or W2.shape != (n_hidden + 1,)):
+            return None
+
+        nn = cls(lr=lr, grad_clip=grad_clip, decay=decay, n_hidden=n_hidden,
+                  anchor_rate=anchor_rate, n_feat=n_feat)
+        nn.W1 = W1.astype(np.float64)
+        nn.W2 = W2.astype(np.float64)
+        nn.proba_history = proba_history
+        nn.n_samples = n_samples
+        return nn
 
 
 # ─────────────────────────────────────────────
@@ -213,6 +323,42 @@ def build_features(row: dict, norm_w: dict) -> FeatVec:
         ref_close = row.get("close", 0.0),
         ref_atr   = row.get("atr", 1.0),
     )
+
+
+@dataclass
+class SeqFeatVec:
+    """
+    Fenêtre de contexte: plusieurs FeatVec consécutifs aplatis en un seul
+    vecteur (du plus ancien au plus récent), pour donner au réseau la
+    "forme" récente du marché plutôt qu'un instantané d'une seule bougie.
+    Duck-type FeatVec (même .to_array()/.ref_close/.ref_atr/.direction) donc
+    NeuralNet.predict()/train_step() l'acceptent sans modification.
+    """
+    arr:       np.ndarray
+    ref_close: float = 0.0
+    ref_atr:   float = 1.0
+    direction: int = 0
+
+    def to_array(self) -> np.ndarray:
+        return self.arr
+
+
+def build_seq_featvec(window, seq_len: int) -> SeqFeatVec:
+    """
+    window: séquence de FeatVec (deque ou liste), la plus récente en dernier.
+    Aplatit les seq_len derniers en un vecteur (seq_len*N_FEAT,). Si window
+    est plus court que seq_len (démarrage), répète le premier élément
+    disponible — pas de zero-padding, qui ressemblerait à un signal neutre réel.
+    """
+    hist = list(window)[-seq_len:]
+    if not hist:
+        return SeqFeatVec(arr=np.zeros(seq_len * N_FEAT, dtype=np.float64))
+    if len(hist) < seq_len:
+        hist = [hist[0]] * (seq_len - len(hist)) + hist
+    arr = np.concatenate([fv.to_array() for fv in hist])
+    last = hist[-1]
+    return SeqFeatVec(arr=arr, ref_close=last.ref_close, ref_atr=last.ref_atr,
+                       direction=last.direction)
 
 
 def compute_label_continuous(current_close: float, ref_close: float,
@@ -312,6 +458,100 @@ def pretrain_on_history(nn: NeuralNet, df_indicators, norm_w: dict,
     if samples:
         if verbose: print(f"  Pré-entraînement: {len(samples)} setups historiques, {n_epochs} epochs...")
         tp_count = sum(1 for _, l, _ in samples if l >= 0.9 or l <= 0.1)
+        print(f"  TP hits: {sum(1 for _,l,_ in samples if l==1.0)} | "
+              f"SL hits: {sum(1 for _,l,_ in samples if l==0.1)} | "
+              f"Neutres: {sum(1 for _,l,_ in samples if l==0.5)}")
+        nn.batch_train(samples, n_epochs=n_epochs)
+        print(f"  Pré-entraînement terminé. Loss finale: {np.mean(nn.train_losses[-100:]):.4f}")
+
+    return len(samples)
+
+
+def generate_seq_samples(df_indicators, norm_w: dict, seq_len: int,
+                          fwd_bars: int = 5, sl_atr: float = 2.0,
+                          tp_atr: float = 4.0) -> list:
+    """
+    Génère les échantillons (SeqFeatVec, label, weight) d'un historique, sans
+    entraîner — permet de regrouper les échantillons de plusieurs actifs avant
+    un entraînement joint (voir pretrain_on_history_seq pour la version qui
+    entraîne directement sur un seul historique).
+    """
+    samples = []
+    close = df_indicators["close"].values
+    atr   = df_indicators["atr"].values
+    in_ob_bull  = df_indicators["in_ob_bull"].values
+    in_ob_bear  = df_indicators["in_ob_bear"].values
+    in_fvg_bull = df_indicators["in_fvg_bull"].values
+    in_fvg_bear = df_indicators["in_fvg_bear"].values
+    rows = df_indicators.to_dict("records")
+
+    n = len(close)
+    window = deque(maxlen=seq_len)
+
+    for i in range(220, n - fwd_bars - 1):
+        if np.isnan(atr[i]) or atr[i] <= 0:
+            continue
+
+        row = rows[i]
+        row["close"] = close[i]
+        row["atr"]   = atr[i]
+        window.append(build_features(row, norm_w))
+
+        if len(window) < seq_len:
+            continue
+
+        in_bull = bool(in_ob_bull[i]) or bool(in_fvg_bull[i])
+        in_bear = bool(in_ob_bear[i]) or bool(in_fvg_bear[i])
+        if not in_bull and not in_bear:
+            continue
+
+        fv = build_seq_featvec(window, seq_len)
+
+        if in_bull:
+            entry = close[i]
+            sl_price = entry - sl_atr * atr[i]
+            tp_price = entry + tp_atr * atr[i]
+            label, weight = 0.5, 1.0
+            for j in range(i + 1, min(i + fwd_bars + 1, n)):
+                if close[j] >= tp_price:
+                    label, weight = 1.0, 2.5
+                    break
+                elif close[j] <= sl_price:
+                    label, weight = 0.1, 1.5
+                    break
+            samples.append((fv, label, weight))
+
+        if in_bear:
+            entry = close[i]
+            sl_price = entry + sl_atr * atr[i]
+            tp_price = entry - tp_atr * atr[i]
+            label, weight = 0.5, 1.0
+            for j in range(i + 1, min(i + fwd_bars + 1, n)):
+                if close[j] <= tp_price:
+                    label, weight = 0.0, 2.5
+                    break
+                elif close[j] >= sl_price:
+                    label, weight = 0.9, 1.5
+                    break
+            samples.append((fv, label, weight))
+
+    return samples
+
+
+def pretrain_on_history_seq(nn: NeuralNet, df_indicators, norm_w: dict, seq_len: int,
+                             verbose: bool = True,
+                             fwd_bars: int = 5, sl_atr: float = 2.0,
+                             tp_atr: float = 4.0, n_epochs: int = 5) -> int:
+    """
+    Variante de pretrain_on_history avec fenêtre de contexte: mêmes setups et
+    labels TP/SL, mais chaque échantillon est un SeqFeatVec (seq_len bougies
+    aplaties) au lieu d'un FeatVec (une seule bougie). nn doit avoir été créé
+    avec n_feat=seq_len*N_FEAT.
+    """
+    samples = generate_seq_samples(df_indicators, norm_w, seq_len, fwd_bars, sl_atr, tp_atr)
+
+    if samples:
+        if verbose: print(f"  Pré-entraînement (fenêtre={seq_len}): {len(samples)} setups, {n_epochs} epochs...")
         print(f"  TP hits: {sum(1 for _,l,_ in samples if l==1.0)} | "
               f"SL hits: {sum(1 for _,l,_ in samples if l==0.1)} | "
               f"Neutres: {sum(1 for _,l,_ in samples if l==0.5)}")
